@@ -1,51 +1,38 @@
 #!/bin/sh
 
 echo "==============================================="
-echo "   INSTALLATORE OPENWRT -> HA (VERSIONE ULTIMATE)"
+echo "   INSTALLATORE OPENWRT -> HOME ASSISTANT"
 echo "==============================================="
 
-# 1. Installazione pacchetti
-opkg update && opkg install mosquitto-client-nossl conntrack jsonfilter
+# 1. Installazione pacchetti necessari
+echo "--- Aggiornamento pacchetti e installazione dipendenze ---"
+opkg update
+opkg install mosquitto-client-nossl conntrack jsonfilter
 
-# 2. Richiesta dati MQTT (Inclusa la porta)
-read -p "Host MQTT: " MQTT_HOST
+# 2. Richiesta dati MQTT
+echo ""
+echo "Inserisci i dati per la connessione MQTT:"
+read -p "Host MQTT (es. 192.168.1.50): " MQTT_HOST
 read -p "Porta MQTT (default 1883): " MQTT_PORT
-MQTT_PORT=${MQTT_PORT:-1883} # Se vuoto, usa 1883
 read -p "Username MQTT: " MQTT_USER
 read -p "Password MQTT: " MQTT_PASS
+echo ""
 
+# 3. Creazione cartella di destinazione
 mkdir -p /etc/openwrt-ha
 
-# 3. Creazione script principale
+# 4. Creazione dello script principale (firewall.sh)
+echo "--- Creazione script principale in /etc/openwrt-ha/firewall.sh ---"
 cat << EOF > /etc/openwrt-ha/firewall.sh
 #!/bin/sh
 MQTT_HOST="$MQTT_HOST"
-MQTT_PORT="$MQTT_PORT"
+MQTT_PORT="1883"
 MQTT_USER="$MQTT_USER"
 MQTT_PASS="$MQTT_PASS"
 PREFIX="homeassistant"
 NODE_ID="openwrt_router"
-NODE_NAME="Router"
-AVAIL_TOPIC="\$PREFIX/switch/\$NODE_ID/availability"
+NODE_NAME="Router OpenWrt"
 SENT_RULES_FILE="/tmp/sent_fw_rules"
-
-# --- FUNZIONI DI SISTEMA ---
-send_online() {
-    mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$AVAIL_TOPIC" -m "online" -r
-}
-
-send_stats() {
-    while true; do
-        UPTIME=\$(uptime | awk '{print \$3}' | sed 's/,//')
-        LOAD=\$(cat /proc/loadavg | awk '{print \$1}')
-        RAM=\$(free -m | grep Mem | awk '{print \$4}')
-        
-        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/sensor/\$NODE_ID/uptime/state" -m "\$UPTIME"
-        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/sensor/\$NODE_ID/load/state" -m "\$LOAD"
-        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/sensor/\$NODE_ID/ram/state" -m "\$RAM"
-        sleep 60
-    done
-}
 
 apply_firewall() {
     local rule_name="\$1"
@@ -77,37 +64,24 @@ cleanup_orphans() {
 
 discovery_and_state() {
     cleanup_orphans
-    send_online
-    
-    # Discovery Sensori e Button
-    mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/sensor/\$NODE_ID/uptime/config" -m "{\"name\": \"Uptime\", \"unique_id\": \"\${NODE_ID}_uptime\", \"state_topic\": \"\$PREFIX/sensor/\$NODE_ID/uptime/state\", \"device\": {\"identifiers\": [\"\$NODE_ID\"], \"name\": \"\$NODE_NAME\"}}" -r
-    mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/button/\$NODE_ID/refresh/config" -m "{\"name\": \"Aggiorna Regole\", \"unique_id\": \"\${NODE_ID}_refresh\", \"command_topic\": \"\$PREFIX/button/\$NODE_ID/refresh/set\", \"availability_topic\": \"\$AVAIL_TOPIC\", \"device\": {\"identifiers\": [\"\$NODE_ID\"]}}" -r
-
-    # Discovery Regole Firewall (Nomi puliti per evitare troncamenti)
+    REFRESH_PAYLOAD="{\"name\": \"Aggiorna Regole Firewall\", \"unique_id\": \"\${NODE_ID}_refresh\", \"command_topic\": \"\$PREFIX/button/\$NODE_ID/refresh/set\", \"icon\": \"mdi:refresh\", \"device\": { \"identifiers\": [\"\$NODE_ID\"], \"name\": \"\$NODE_NAME\" }}"
+    mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/button/\$NODE_ID/refresh/config" -m "\$REFRESH_PAYLOAD" -r
     i=0
     while true; do
         NAME=\$(uci get firewall.@rule[\$i].name 2>/dev/null)
         [ -z "\$NAME" ] && break
-        
-        # Pulizia nome: toglie prefissi comuni
-        DISPLAY_NAME=\$(echo "\$NAME" | sed 's/Allow-//g; s/Block-//g; s/Blocco-//g')
-        
-        PAYLOAD="{\"name\": \"\$DISPLAY_NAME\", \"unique_id\": \"\$NAME\", \"state_topic\": \"\$PREFIX/switch/\$NODE_ID/\$NAME/state\", \"command_topic\": \"\$PREFIX/switch/\$NODE_ID/\$NAME/set\", \"availability_topic\": \"\$AVAIL_TOPIC\", \"payload_available\": \"online\", \"payload_not_available\": \"offline\", \"device\": {\"identifiers\": [\"\$NODE_ID\"]}}"
-        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/switch/\$NODE_ID/\$NAME/config" -m "\$PAYLOAD" -r
-        
+        BASE_TOPIC="\$PREFIX/switch/\$NODE_ID/\$NAME"
+        PAYLOAD="{\"name\": \"Firewall \$NAME\", \"unique_id\": \"\$NAME\", \"state_topic\": \"\$BASE_TOPIC/state\", \"command_topic\": \"\$BASE_TOPIC/set\", \"payload_on\": \"1\", \"payload_off\": \"0\", \"device\": { \"identifiers\": [\"\$NODE_ID\"], \"name\": \"\$NODE_NAME\" }}"
+        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$BASE_TOPIC/config" -m "\$PAYLOAD" -r
         ENABLED=\$(uci get firewall.@rule[\$i].enabled 2>/dev/null || echo "1")
-        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/switch/\$NODE_ID/\$NAME/state" -m "\$ENABLED" -r
+        mosquitto_pub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$BASE_TOPIC/state" -m "\$ENABLED" -r
         i=\$((i+1))
     done
     uci show firewall | grep "firewall.@rule" | grep ".name=" | cut -d"'" -f2 > "\$SENT_RULES_FILE"
 }
 
-send_stats &
-
 listen() {
-    mosquitto_sub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" \
-        -t "\$PREFIX/+/\$NODE_ID/+/set" \
-        --will-topic "\$AVAIL_TOPIC" --will-payload "offline" --will-retain -v | while read -r line; do
+    mosquitto_sub -h "\$MQTT_HOST" -p "\$MQTT_PORT" -u "\$MQTT_USER" -P "\$MQTT_PASS" -t "\$PREFIX/+/\$NODE_ID/+/set" -v | while read -r line; do
         TOPIC=\$(echo "\$line" | cut -d' ' -f1)
         MSG=\$(echo "\$line" | cut -d' ' -f2)
         if echo "\$TOPIC" | grep -q "button/.*/refresh/set"; then
@@ -125,7 +99,8 @@ EOF
 
 chmod +x /etc/openwrt-ha/firewall.sh
 
-# 5. Creazione servizio init.d (Con gestione offline corretta)
+# 5. Creazione del servizio init.d
+echo "--- Configurazione servizio di sistema ---"
 cat << 'EOF' > /etc/init.d/firewall_ha
 #!/bin/sh /etc/rc.common
 START=99
@@ -139,10 +114,7 @@ start_service() {
     procd_close_instance
 }
 stop_service() {
-    . /etc/openwrt-ha/firewall.sh
-    mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$AVAIL_TOPIC" -m "offline" -r
     killall mosquitto_sub 2>/dev/null
-    killall firewall.sh 2>/dev/null
 }
 EOF
 
@@ -151,6 +123,6 @@ chmod +x /etc/init.d/firewall_ha
 /etc/init.d/firewall_ha start
 
 echo "==============================================="
-echo "   INSTALLAZIONE COMPLETATA!"
-echo "   Dispositivo HA: $NODE_NAME (Porta: $MQTT_PORT)"
+echo "   INSTALLAZIONE COMPLETATA CON SUCCESSO!"
+echo "   Il servizio è attivo e configurato."
 echo "==============================================="
