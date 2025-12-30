@@ -1,29 +1,29 @@
 #!/bin/sh
 # --- CONFIGURAZIONE MQTT ---
-MQTT_HOST="10.0.0.5"       # IP del tuo Broker (es. Home Assistant)
-MQTT_PORT="1883"           # Porta MQTT standard
-MQTT_USER="mqtt_user"
-MQTT_PASS="mqttuser"
-PREFIX="homeassistant"     # Prefisso per Discovery HA
-NODE_ID="openwrt_router"   # Identificativo del router su HA
-NODE_NAME="Router OpenWrt" # Nome del dispositivo principale
+MQTT_HOST="10.0.0.x"
+MQTT_PORT="1883"
+MQTT_USER="tuo_user"
+MQTT_PASS="tuo_pass"
+PREFIX="homeassistant"
+NODE_ID="openwrt_router"
+NODE_NAME="Router OpenWrt"
 
+# File temporaneo per tracciare le regole inviate a HA
+SENT_RULES_FILE="/tmp/sent_fw_rules"
 
 # --- FUNZIONE APPLICAZIONE REGOLE ---
 apply_firewall() {
     local rule_name="$1"
     local action="$2"
     
-    # Cerchiamo l'indice della regola in UCI
     INDEX=$(uci show firewall | grep ".name='$rule_name'" | cut -d'[' -f2 | cut -d']' -f1)
     
     if [ -n "$INDEX" ]; then
-        echo "Azione: Imposto rule $rule_name (indice $INDEX) a stato $action"
+        echo "Azione su $rule_name: $action"
         uci set firewall.@rule[$INDEX].enabled="$action"
         uci commit firewall
         /etc/init.d/firewall reload
         
-        # Kill sessioni con conntrack se abilitiamo il blocco (action=1)
         if [ "$action" = "1" ]; then
             MAC=$(uci get firewall.@rule[$INDEX].src_mac 2>/dev/null)
             if [ -n "$MAC" ]; then
@@ -31,17 +31,44 @@ apply_firewall() {
                 [ -n "$IP" ] && conntrack -D -s "$IP" 2>/dev/null
             fi
         fi
-        
-        # Feedback immediato a Home Assistant
         mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$PREFIX/switch/$NODE_ID/$rule_name/state" -m "$action" -r
-    else
-        echo "Errore: Regola '$rule_name' non trovata in UCI"
     fi
+}
+
+# --- FUNZIONE DI PULIZIA ORFANI ---
+# Rimuove da HA le regole che non esistono più sul router
+cleanup_orphans() {
+    [ ! -f "$SENT_RULES_FILE" ] && return
+    
+    echo "Controllo regole rimosse..."
+    for OLD_NAME in $(cat "$SENT_RULES_FILE"); do
+        if ! uci show firewall | grep "firewall.@rule" | grep -q ".name='$OLD_NAME'"; then
+            echo "Regola '$OLD_NAME' non più presente. Rimuovo da Home Assistant..."
+            # Inviando un payload vuoto (-n) al topic config, HA elimina l'entità
+            mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" \
+                -t "$PREFIX/switch/$NODE_ID/$OLD_NAME/config" -r -n
+        fi
+    done
 }
 
 # --- DISCOVERY & STATO ---
 discovery_and_state() {
-    echo "Inviando Discovery..."
+    # 1. Pulisce le regole vecchie prima di inviare le nuove
+    cleanup_orphans
+
+    echo "Eseguo scansione regole firewall..."
+    
+    # 2. Discovery del tasto REFRESH
+    REFRESH_PAYLOAD="{
+        \"name\": \"Aggiorna Regole Firewall\",
+        \"unique_id\": \"${NODE_ID}_refresh\",
+        \"command_topic\": \"$PREFIX/button/$NODE_ID/refresh/set\",
+        \"icon\": \"mdi:refresh\",
+        \"device\": { \"identifiers\": [\"$NODE_ID\"], \"name\": \"$NODE_NAME\" }
+    }"
+    mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$PREFIX/button/$NODE_ID/refresh/config" -m "$REFRESH_PAYLOAD" -r
+
+    # 3. Scansione regole correnti
     i=0
     while true; do
         NAME=$(uci get firewall.@rule[$i].name 2>/dev/null)
@@ -50,6 +77,8 @@ discovery_and_state() {
         UNIQUE_ID="$NAME"
         BASE_TOPIC="$PREFIX/switch/$NODE_ID/$UNIQUE_ID"
         
+        echo "Esporto regola: $NAME"
+
         PAYLOAD="{
             \"name\": \"Firewall $NAME\",
             \"unique_id\": \"$UNIQUE_ID\",
@@ -57,11 +86,7 @@ discovery_and_state() {
             \"command_topic\": \"$BASE_TOPIC/set\",
             \"payload_on\": \"1\",
             \"payload_off\": \"0\",
-            \"device\": {
-                \"identifiers\": [\"$NODE_ID\"],
-                \"name\": \"$NODE_NAME\",
-                \"manufacturer\": \"OpenWrt\"
-            }
+            \"device\": { \"identifiers\": [\"$NODE_ID\"], \"name\": \"$NODE_NAME\" }
         }"
         
         mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$BASE_TOPIC/config" -m "$PAYLOAD" -r
@@ -71,23 +96,27 @@ discovery_and_state() {
         
         i=$((i+1))
     done
+
+    # 4. Aggiorna il file temporaneo con la lista attuale
+    uci show firewall | grep "firewall.@rule" | grep ".name=" | cut -d"'" -f2 > "$SENT_RULES_FILE"
 }
 
-# --- LISTENER (PARSING CON SED) ---
-# Usa sed per estrarre il nome senza bisogno del comando 'rev'
+# --- LISTENER ---
 listen() {
     echo "Listener pronto..."
-    mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$PREFIX/switch/$NODE_ID/+/set" -v | while read -r line; do
-        
+    mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASS" -t "$PREFIX/+/$NODE_ID/+/set" -v | while read -r line; do
         TOPIC=$(echo "$line" | cut -d' ' -f1)
         MSG=$(echo "$line" | cut -d' ' -f2)
         
-        # LOGICA SED: rimuove '/set' finale e tutto quello che c'è prima dell'ultimo '/'
-        # Trasforma 'homeassistant/switch/openwrt_router/testsmartv/set' in 'testsmartv'
+        if echo "$TOPIC" | grep -q "button/.*/refresh/set"; then
+            echo "Comando Refresh ricevuto: rieseguo scansione..."
+            discovery_and_state
+            continue
+        fi
+
         R_NAME=$(echo "$TOPIC" | sed 's|/set$||; s|.*/||')
-        
         if [ -n "$R_NAME" ]; then
-            echo "Ricevuto comando $MSG per la regola UCI: $R_NAME"
+            echo "Comando $MSG per regola: $R_NAME"
             apply_firewall "$R_NAME" "$MSG"
         fi
     done
