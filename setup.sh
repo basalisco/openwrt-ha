@@ -119,6 +119,7 @@ stop_service() {
 EOF
 
 chmod +x /etc/init.d/firewall_ha
+sh /etc/openwrt-ha/firewall.sh
 /etc/init.d/firewall_ha enable
 /etc/init.d/firewall_ha start
 
